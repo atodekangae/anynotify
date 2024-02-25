@@ -190,7 +190,11 @@ class LoggingIntegration:
             self.logger.removeHandler(self.handler)
 
 class BaseClient:
+
     def push_event(self, event):
+        raise NotImplementedError
+
+    def initialize(self, hub, worker: BaseWorker):
         raise NotImplementedError
 
 class DiscordClient(BaseClient):
@@ -200,14 +204,15 @@ class DiscordClient(BaseClient):
         self.initialized = False
         self.ratelimiter = ratelimiter or RateLimiter(60, 10, 0.5)
 
-    def initialize(self, hub):
+    def initialize(self, worker):
         if self.initialized:
             raise RuntimeError()
         self.initialized = True
         self.hub = hub
+        self.worker = worker
 
     def push_event(self, event):
-        self.hub.submit(self.get_post_func(event))
+        self.worker.submit(self.get_post_func(event))
 
     def get_post_func(self, event):
         import requests
@@ -228,7 +233,7 @@ class DiscordClient(BaseClient):
                 }
             ],
         }
-        sleep_func = self.hub.worker.__class__.sleep_func
+        sleep_func = self.worker.__class__.sleep_func
         def _post():
             # could affect other client
             duration = self.ratelimiter.get_wait_duration()
@@ -246,21 +251,25 @@ class DiscordClient(BaseClient):
         pass
 
 class Hub:
+
     def __init__(self, *, worker_cls, clients: T.Sequence[BaseClient], integrations=(), termination_seconds: int=10):
         if worker_cls is None:
             if GEVENT_ALREADY_IMPORTED:
                 worker_cls = GeventWorker
             else:
                 worker_cls = ThreadWorker
-        self.worker = worker_cls(exception_handler=self.handle_internal_exception)
-        self.worker.start()
         self.clients = clients
+        worker_by_client = {}
         for c in clients:
-            c.initialize(self)
+            worker = worker_cls(exception_handler=self.handle_internal_exception)
+            worker_by_client[c] = worker
+            c.initialize(worker)
+        for w in worker_by_client.values():
+            w.start()
+        self.worker_by_client = worker_by_client
         self.integrations = integrations
         for i in integrations:
             i.initialize(self)
-        self.submit_timestamps = []
         self.termination_seconds = termination_seconds
 
     def handle_internal_exception(self, e):
@@ -272,10 +281,15 @@ class Hub:
         for c in self.clients:
             c.push_event(event)
 
+    def push_exception(self, e):
+        self.push_event(Event(ERROR, 'Exception raised', exc_info=(type(e), e, e.__traceback__)))
+
     def close(self):
-        nothing_remains = self.worker.flush(self.termination_seconds)
-        if not nothing_remains:
-            print('could not clear the queue before exiting')
+        # in parallel
+        for w in self.worker_by_client.values():
+            nothing_remains = w.flush(self.termination_seconds)
+            if not nothing_remains:
+                print(f'worker {w!r} could not clear the queue before exiting')
         for i in self.integrations:
             i.finalize()
 
@@ -283,13 +297,20 @@ class Hub:
         return self
 
     def __exit__(self, *args, **kwargs):
+        global hub
         self.close()
+        hub = None
 
     def submit(self, callback) -> bool:
         ok = self.worker.submit(callback)
         return ok
 
+hub = None
+
 def init(*, client, integrations=(), worker_cls=None):
+    global hub
+    if hub is not None:
+        raise RuntimeError('already initialized')
     if hasattr(client, '__iter__'):
         clients = list(client)
     else:
