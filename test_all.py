@@ -24,6 +24,7 @@ def test_gevent():
     import anynotify
     import logging
     import time
+    import gevent
 
     with patch('requests.post') as mock_post:
         mock_response = MagicMock()
@@ -32,7 +33,7 @@ def test_gevent():
         started = time.monotonic()
         with anynotify.init(
             worker_cls=anynotify.GeventWorker,
-            client=anynotify.DiscordClient('https://localhost/webhook'),
+            client=anynotify.DiscordClient('https://localhost/webhook', anynotify.RateLimiter(60, 10, 0.1)),
             integrations=[anynotify.LoggingIntegration()]) as hub:
 
             logging.info('test')
@@ -45,7 +46,36 @@ def test_gevent():
                 logging.exception('test 4')
         elapsed = time.monotonic() - started
         assert mock_post.call_count == 4
-        assert elapsed > 0.5 * 3
+        assert elapsed > 0.1 * 3
+
+    with patch('requests.post') as mock_post:
+        mock_response = MagicMock()
+        mock_response.status_code = 204
+        mock_post.return_value = mock_response
+        started = time.monotonic()
+        with anynotify.init(
+            worker_cls=anynotify.GeventWorker,
+            client=anynotify.DiscordClient('https://localhost/webhook', anynotify.RateLimiter(60, 10, 0)),
+            integrations=[anynotify.LoggingIntegration()]) as hub:
+
+            logging.info('test')
+            def f(n):
+                hub.push_context(x=n)
+                gevent.sleep((3-n)/10)
+                logging.warning('test %d', n)
+            gs = []
+            for i in range(3):
+                gs.append(gevent.spawn(f, i))
+            for g in gs:
+                g.join()
+        elapsed = time.monotonic() - started
+        d = mock_post.call_args_list[0].kwargs['json']['embeds'][0]['description']
+        assert 'test 2' in d and "'x': 2" in d
+        d = mock_post.call_args_list[1].kwargs['json']['embeds'][0]['description']
+        assert 'test 1' in d and "'x': 1" in d
+        d = mock_post.call_args_list[2].kwargs['json']['embeds'][0]['description']
+        assert 'test 0' in d and "'x': 0" in d
+        assert mock_post.call_count == 3
 
 def test_ratelimit():
     import anynotify

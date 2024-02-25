@@ -3,6 +3,7 @@ import logging
 import traceback
 import time
 import dataclasses
+import pprint
 import typing as T
 
 logger = logging.getLogger(__name__)
@@ -55,6 +56,24 @@ class RateLimiter:
 
 HALT = object()
 
+class LocalCtxMixIn:
+
+    def __init__(self):
+        self.contexts = []
+
+    def push_context(self, ctx: dict):
+        self.contexts.append(ctx)
+
+    def pop_context(self):
+        self.contexts.pop()
+
+    def get_ctx(self):
+        ctx = {}
+        for c in self.contexts:
+            ctx.update(c)
+        return ctx
+
+
 class BaseWorker:
 
     sleep_func = time.sleep
@@ -73,6 +92,10 @@ class BaseWorker:
     def flush(self, timeout) -> bool:
         raise NotImplementedError
 
+    @staticmethod
+    def get_local_object():
+        raise NotImplementedError
+
 class SyncWorker(BaseWorker):
 
     def submit(self, callback) -> bool:
@@ -85,6 +108,9 @@ class SyncWorker(BaseWorker):
 
     def flush(self, timeout):
         return True
+
+    def get_local_object():
+        return LocalCtxMixIn()
 
 class ThreadWorker(BaseWorker):
     pass
@@ -106,6 +132,13 @@ if gevent is not None:
             super().__init__(*args, **kwargs)
             self.queue = gevent.queue.JoinableQueue(max_queue_size)
             self.started = False
+
+        @staticmethod
+        def get_local_object():
+            from gevent.local import local
+            class GreenletLocal(local, LocalCtxMixIn):
+                pass
+            return GreenletLocal()
 
         def start(self):
             if self.started:
@@ -133,12 +166,6 @@ if gevent is not None:
         def flush(self, timeout):
             return self.queue.join(timeout=timeout)
 
-        def __le__(self, other):
-            print(other)
-
-        def __lt__(self, other):
-            print(other)
-
 class NotifyLoggingHandler(logging.Handler):
 
     def __init__(self, *args, **kwargs):
@@ -154,7 +181,7 @@ class NotifyLoggingHandler(logging.Handler):
     def emit(self, record):
         event = Event(
             level=record.levelname,
-            message=record.msg,
+            message=record.getMessage(),
             extra=getattr(record, 'extra', None),
             exc_info=record.exc_info,
         )
@@ -224,11 +251,21 @@ class DiscordClient(BaseClient):
             ERROR: 0xff0000,    # Red
             CRITICAL: 0x4b0082, # Indigo
         }
+        chunks = []
+        if event.message.strip():
+            chunks.append(event.message)
+        if event.exc_info is not None:
+            chunks.extend(['\n', '```\n', *traceback.format_exception(*event.exc_info), '```'])
+        if event.extra:
+            chunks.append('\n```\n')
+            chunks.append(pprint.pformat(event.extra))
+            chunks.append('\n```')
+        text = ''.join(chunks).strip()
         payload = {
             "embeds": [
                 {
                     "title": f"Log Message - {event.level}",
-                    "description": event.message + '' if event.exc_info is None else ''.join(['\n', *traceback.format_exception(*event.exc_info)]),
+                    "description": text,
                     "color": level_colors.get(event.level, 0x000000),
                 }
             ],
@@ -259,6 +296,7 @@ class Hub:
             else:
                 worker_cls = ThreadWorker
         self.clients = clients
+        self.local = worker_cls.get_local_object()
         worker_by_client = {}
         for c in clients:
             worker = worker_cls(exception_handler=self.handle_internal_exception)
@@ -278,18 +316,30 @@ class Hub:
         print(''.join(traceback.format_exception(type(e), e, e.__traceback__)))
 
     def push_event(self, event):
+        ctx = self.local.get_ctx()
+        new_event = dataclasses.replace(event, extra={
+            **ctx,
+            **(event.extra or {})
+        })
         for c in self.clients:
-            c.push_event(event)
+            c.push_event(new_event)
 
     def push_exception(self, e):
         self.push_event(Event(ERROR, 'Exception raised', exc_info=(type(e), e, e.__traceback__)))
 
+    def push_context(self, **ctx):
+        # inherit when spawning a new thread/greenlet?
+        self.local.push_context(ctx)
+
+    def pop_context(self):
+        self.local.pop_context(ctx)
+
     def close(self):
         # in parallel
-        for w in self.worker_by_client.values():
+        for c, w in self.worker_by_client.items():
             nothing_remains = w.flush(self.termination_seconds)
             if not nothing_remains:
-                print(f'worker {w!r} could not clear the queue before exiting')
+                print(f'worker {w!r} for client {c!r} could not clear the queue before exiting')
         for i in self.integrations:
             i.finalize()
 
@@ -300,10 +350,6 @@ class Hub:
         global hub
         self.close()
         hub = None
-
-    def submit(self, callback) -> bool:
-        ok = self.worker.submit(callback)
-        return ok
 
 hub = None
 
