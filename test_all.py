@@ -85,12 +85,12 @@ def test_async(kind):
             for g in gs:
                 g.join()
         elapsed = time.monotonic() - started
-        d = mock_post.call_args_list[0].kwargs['json']['embeds'][0]['description']
-        assert 'test 2' in d and "'x': 2" in d
-        d = mock_post.call_args_list[1].kwargs['json']['embeds'][0]['description']
-        assert 'test 1' in d and "'x': 1" in d
-        d = mock_post.call_args_list[2].kwargs['json']['embeds'][0]['description']
-        assert 'test 0' in d and "'x': 0" in d
+        e = mock_post.call_args_list[0].kwargs['json']['embeds'][0]
+        assert 'test 2' in e['title'] and "'x': 2" in e['description']
+        e = mock_post.call_args_list[1].kwargs['json']['embeds'][0]
+        assert 'test 1' in e['title'] and "'x': 1" in e['description']
+        e = mock_post.call_args_list[2].kwargs['json']['embeds'][0]
+        assert 'test 0' in e['title'] and "'x': 0" in e['description']
         assert mock_post.call_count == 3
 
 def test_ratelimit():

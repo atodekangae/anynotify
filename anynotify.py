@@ -288,7 +288,10 @@ class DiscordClient(BaseClient):
         self.worker = worker
 
     def push_event(self, event):
-        return self.worker.submit(self.get_post_func(event))
+        func = self.get_post_func(event)
+        if func is None:
+            return True
+        return self.worker.submit(func)
 
     def get_post_func(self, event):
         import requests
@@ -302,7 +305,7 @@ class DiscordClient(BaseClient):
         }
         chunks = []
         if event.message.strip():
-            chunks.append(event.message)
+            chunks.append(f'{event.level}: {event.message}')
         if event.exc_info is not None:
             chunks.extend(['\n', '```\n', *traceback.format_exception(*event.exc_info), '```'])
         if event.extra:
@@ -310,11 +313,18 @@ class DiscordClient(BaseClient):
             chunks.append(pprint.pformat(event.extra))
             chunks.append('\n```')
         text = ''.join(chunks).strip()
+        if not text:
+            return None
+        first, *rest = text.splitlines()
+        if rest:
+            description = '\n'.join(rest)
+        else:
+            description = None
         payload = {
             "embeds": [
                 {
-                    "title": f"Log Message - {event.level}",
-                    "description": text,
+                    "title": first,
+                    "description": description,
                     "color": level_colors.get(event.level, 0x000000),
                 }
             ],
@@ -358,6 +368,7 @@ class Hub:
         for i in integrations:
             i.initialize(self)
         self.termination_seconds = termination_seconds
+        self.closed = False
 
     def handle_internal_exception(self, e):
         import traceback
@@ -386,7 +397,10 @@ class Hub:
         self.local.pop_context(ctx)
 
     def close(self):
-        # in parallel
+        if self.closed:
+            return
+        self.closed = True
+        # in parallel?
         for c, w in self.worker_by_client.items():
             nothing_remains = w.flush(self.termination_seconds)
             if not nothing_remains:
@@ -404,7 +418,7 @@ class Hub:
 
 hub = None
 
-def init(*, client, integrations=(), worker_cls=None):
+def init(*, client, integrations=(), worker_cls=None, close_on_exit=True):
     global hub
     if hub is not None:
         raise RuntimeError('already initialized')
@@ -413,4 +427,7 @@ def init(*, client, integrations=(), worker_cls=None):
     else:
         clients = [client]
     hub = Hub(worker_cls=worker_cls, clients=clients, integrations=integrations)
+    if close_on_exit:
+        import atexit
+        atexit.register(hub.close)
     return hub
