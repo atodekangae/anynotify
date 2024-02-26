@@ -21,6 +21,32 @@ def test_sync():
             logging.warning('test')
             assert mock_post.call_count == 1
 
+def test_wsig():
+    import anynotify
+    from werkzeug.test import Client
+    from werkzeug.wrappers import Response
+
+    wsgi_integration = anynotify.WsgiIntegration()
+    def application(environ, start_response):
+        1/0
+    wrapped = wsgi_integration.wrap(application)
+
+    with anynotify.init(worker_cls=anynotify.SyncWorker, client=anynotify.DiscordClient('http://localhost/webhook'), integrations=[wsgi_integration]):
+        with patch('requests.post') as mock_post:
+            mock_response = MagicMock()
+            mock_response.status_code = 204
+            mock_post.return_value = mock_response
+
+            client = Client(wrapped, Response)
+            with pytest.raises(ZeroDivisionError):
+                response = client.get('/test')
+
+            assert mock_post.call_count == 1
+            d = mock_post.call_args_list[0].kwargs['json']['embeds'][0]['description']
+            assert 'http://localhost/test' in d
+            assert 'GET' in d
+            assert 'ZeroDivisionError' in d
+
 @pytest.mark.parametrize('kind', ['gevent', 'thread'])
 def test_async(kind):
     import anynotify

@@ -18,7 +18,7 @@ setup(
         'requests>=2.26.0',
     ],
     extras_require={
-        'dev': ['pytest>=6.0,<7.0', 'gevent>=24.2.1,<25.0.0'],
+        'dev': ['pytest>=6.0,<7.0', 'gevent>=24.2.1,<25.0.0', 'werkzeug>=3.0.1'],
     },
     classifiers=[
         'Environment :: Web Environment',

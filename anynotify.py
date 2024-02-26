@@ -109,6 +109,7 @@ class SyncWorker(BaseWorker):
     def flush(self, timeout):
         return True
 
+    @staticmethod
     def get_local_object():
         return LocalCtxMixIn()
 
@@ -265,12 +266,32 @@ class LoggingIntegration:
         if self.handler_added:
             self.logger.removeHandler(self.handler)
 
+class ExcepthookIntegration:
+
+    def initialize(self, hub):
+        import sys
+        self.old_excepthook = sys.excepthook
+        sys.excepthook = self.new_excepthook = self.get_excepthook(hub, self.old_excepthook)
+
+    def finalize(self):
+        if sys.excepthook is self.new_excepthook:
+            sys.excepthook = self.old_excepthook
+        else:
+            logger.warning('excepthook could not be uninstalled because it has been modified')
+
+    @staticmethod
+    def get_excepthook(hub, old_excepthook):
+        def _excepthook(typ, value, traceback):
+            hub.push_event(Event(ERROR, 'Unhandled exception', extra=None, exc_info=(typ, value, traceback)))
+            return old_excepthook(typ, value, traceback)
+        return _excepthook
+
 class BaseClient:
 
-    def push_event(self, event):
+    def push_event(self, event: Event):
         raise NotImplementedError
 
-    def initialize(self, hub, worker: BaseWorker):
+    def initialize(self, worker: BaseWorker):
         raise NotImplementedError
 
 class DiscordClient(BaseClient):
@@ -303,35 +324,28 @@ class DiscordClient(BaseClient):
             ERROR: 0xff0000,    # Red
             CRITICAL: 0x4b0082, # Indigo
         }
-        chunks = []
+        title = None
         if event.message.strip():
-            chunks.append(f'{event.level}: {event.message}')
+            title = f'{event.level}: {event.message}'
+        chunks = []
         if event.exc_info is not None:
-            chunks.extend(['\n', '```\n', *traceback.format_exception(*event.exc_info), '```'])
+            chunks.extend(['```\n', *traceback.format_exception(*event.exc_info), '```'])
         if event.extra:
             chunks.append('\n```\n')
             chunks.append(pprint.pformat(event.extra))
             chunks.append('\n```')
         text = ''.join(chunks).strip()
-        if not text:
-            return None
-        first, *rest = text.splitlines()
-        if rest:
-            description = '\n'.join(rest)
-        else:
-            description = None
         payload = {
             "embeds": [
                 {
-                    "title": first,
-                    "description": description,
+                    "title": title,
+                    "description": text,
                     "color": level_colors.get(event.level, 0x000000),
                 }
             ],
         }
         sleep_func = self.worker.__class__.sleep_func
         def _post():
-            # could affect other client
             duration = self.ratelimiter.get_wait_duration()
             if duration is not None:
                 sleep_func(duration)
@@ -344,6 +358,28 @@ class DiscordClient(BaseClient):
         return _post
 
     def flush(self):
+        pass
+
+class WsgiIntegration:
+
+    def wrap(self, app):
+        def _app(environ, start_response):
+            from werkzeug.wrappers import Request
+            req = Request(environ)
+            self.hub.push_context(url=req.url, method=req.method)
+            try:
+                return app(environ, start_response)
+            except Exception as e:
+                self.hub.push_exception(e)
+                raise
+            finally:
+                self.hub.pop_context()
+        return _app
+
+    def initialize(self, hub):
+        self.hub = hub
+
+    def finalize(self):
         pass
 
 class Hub:
@@ -387,14 +423,15 @@ class Hub:
                 logger.warning('failed pushing event: {new_event!r}, client: {c!r}')
 
     def push_exception(self, e):
-        self.push_event(Event(ERROR, 'Exception raised', exc_info=(type(e), e, e.__traceback__)))
+        self.push_event(Event(ERROR, 'Exception raised', extra=None, exc_info=(type(e), e, e.__traceback__)))
 
     def push_context(self, **ctx):
         # inherit when spawning a new thread/greenlet?
+        # but that requires hooking threading.Thread and such
         self.local.push_context(ctx)
 
     def pop_context(self):
-        self.local.pop_context(ctx)
+        self.local.pop_context()
 
     def close(self):
         if self.closed:
