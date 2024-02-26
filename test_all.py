@@ -1,4 +1,5 @@
 from unittest.mock import patch, MagicMock
+import pytest
 
 import sys
 from pathlib import Path
@@ -20,11 +21,26 @@ def test_sync():
             logging.warning('test')
             assert mock_post.call_count == 1
 
-def test_gevent():
+@pytest.mark.parametrize('kind', ['gevent', 'thread'])
+def test_async(kind):
     import anynotify
     import logging
     import time
-    import gevent
+    if kind == 'gevent':
+        import gevent
+        sleep = gevent.sleep
+        spawn = gevent.spawn
+        worker_cls = anynotify.GeventWorker
+    elif kind == 'thread':
+        import threading
+        sleep = time.sleep
+        def spawn(target, *args):
+            t = threading.Thread(target=target, args=args)
+            t.start()
+            return t
+        worker_cls = anynotify.ThreadWorker
+    else:
+        raise ValueError()
 
     with patch('requests.post') as mock_post:
         mock_response = MagicMock()
@@ -32,8 +48,8 @@ def test_gevent():
         mock_post.return_value = mock_response
         started = time.monotonic()
         with anynotify.init(
-            worker_cls=anynotify.GeventWorker,
-            client=anynotify.DiscordClient('https://localhost/webhook', anynotify.RateLimiter(60, 10, 0.1)),
+            worker_cls=worker_cls,
+            client=anynotify.DiscordClient('http://localhost/webhook', anynotify.RateLimiter(60, 10, 0.1)),
             integrations=[anynotify.LoggingIntegration()]) as hub:
 
             logging.info('test')
@@ -54,18 +70,18 @@ def test_gevent():
         mock_post.return_value = mock_response
         started = time.monotonic()
         with anynotify.init(
-            worker_cls=anynotify.GeventWorker,
-            client=anynotify.DiscordClient('https://localhost/webhook', anynotify.RateLimiter(60, 10, 0)),
+            worker_cls=worker_cls,
+            client=anynotify.DiscordClient('http://localhost/webhook', anynotify.RateLimiter(60, 10, 0)),
             integrations=[anynotify.LoggingIntegration()]) as hub:
 
             logging.info('test')
             def f(n):
                 hub.push_context(x=n)
-                gevent.sleep((3-n)/10)
+                sleep((3-n)/10)
                 logging.warning('test %d', n)
             gs = []
             for i in range(3):
-                gs.append(gevent.spawn(f, i))
+                gs.append(spawn(f, i))
             for g in gs:
                 g.join()
         elapsed = time.monotonic() - started
