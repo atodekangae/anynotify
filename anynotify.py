@@ -113,7 +113,56 @@ class SyncWorker(BaseWorker):
         return LocalCtxMixIn()
 
 class ThreadWorker(BaseWorker):
-    pass
+
+    def __init__(self, max_queue_size=0, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        import queue
+        self.queue = queue.Queue(max_queue_size)
+        self.started = False
+
+    def start(self):
+        import threading
+        if self.started:
+            raise RuntimeError()
+        self.started = True
+        self.thread = threading.Thread(target=self.target)
+        self.thread.daemon = True
+        self.thread.start()
+
+    def target(self):
+        while True:
+            callback = self.queue.get()
+            try:
+                callback()
+            except Exception as e:
+                self.exception_handler(e)
+            finally:
+                self.queue.task_done()
+
+    def submit(self, callback):
+        import queue
+        try:
+            self.queue.put(callback, block=False)
+        except queue.Full:
+            return False
+        return True
+
+    @staticmethod
+    def get_local_object():
+        import threading
+        class ThreadLocal(threading.local, LocalCtxMixIn):
+            pass
+        return ThreadLocal()
+
+    def flush(self, timeout):
+        if not self.queue.unfinished_tasks:
+            return True
+        deadline = time.monotonic() + timeout
+        while self.queue.unfinished_tasks:
+            if time.monotonic() > deadline:
+                return False
+            time.sleep(0.1)
+        return True
 
 GEVENT_ALREADY_IMPORTED = 'gevent' in sys.modules
 try:
@@ -239,7 +288,7 @@ class DiscordClient(BaseClient):
         self.worker = worker
 
     def push_event(self, event):
-        self.worker.submit(self.get_post_func(event))
+        return self.worker.submit(self.get_post_func(event))
 
     def get_post_func(self, event):
         import requests
@@ -322,7 +371,9 @@ class Hub:
             **(event.extra or {})
         })
         for c in self.clients:
-            c.push_event(new_event)
+            success = c.push_event(new_event)
+            if not success:
+                logger.warning('failed pushing event: {new_event!r}, client: {c!r}')
 
     def push_exception(self, e):
         self.push_event(Event(ERROR, 'Exception raised', exc_info=(type(e), e, e.__traceback__)))
